@@ -3,11 +3,14 @@
   Copyright (C) 2016 Nikolaus Rath <Nikolaus@rath.org>
 
   This program can be distributed under the terms of the GNU GPLv2.
-  See the file COPYING.
+  See the file GPL2.txt.
 */
 
 
 #define FUSE_USE_VERSION 30
+
+/* Not really needed - just to test build with FUSE_USE_VERSION == 30 */
+#include <fuse.h>
 
 #include <fuse_config.h>
 #include <fuse_lowlevel.h>
