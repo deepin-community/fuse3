@@ -14,7 +14,7 @@ import threading
 # example, if a request handler raises an exception, the server first signals an
 # error to FUSE (causing the test to fail), and then logs the exception. Without
 # the extra delay, the exception will go into nowhere.
-@pytest.mark.hookwrapper
+@pytest.hookimpl(hookwrapper=True)
 def pytest_pyfunc_call(pyfuncitem):
     outcome = yield
     failed = outcome.excinfo is not None
@@ -77,8 +77,11 @@ class OutputChecker:
             cp = re.compile(pattern, re.IGNORECASE | re.MULTILINE)
             hit = cp.search(buf)
             if hit:
-                raise AssertionError('Suspicious output to stderr (matched "%s")'
-                                     % hit.group(0))
+                # Skip FUSE error messages in the format "unique: X, error: -Y (...), outsize: Z"
+                # These are no errors, but just fuse debug messages with the return code
+                if re.search(r'unique: \d+, error: -\d+ \(.*\), outsize: \d+', hit.group(0)):
+                    continue
+                raise AssertionError(f'Suspicious output to stderr (matched "{hit.group(0)}")')
 
 @pytest.fixture()
 def output_checker(request):
