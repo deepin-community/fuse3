@@ -1,3 +1,9 @@
+fuse3 (3.14.0-5deepin1) unstable; urgency=medium
+
+  * Add ulnfs to mountpoint file system whitelist.
+
+ -- wangrong <wangrong@uniontech.com>  Tue, 30 Dec 2025 15:56:42 +0800
+
 fuse3 (3.14.0-5) unstable; urgency=medium
 
   * Fix 99-fuse3.rules path (closes: #1060067).
