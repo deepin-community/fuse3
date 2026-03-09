@@ -5,11 +5,12 @@
   Architecture-independent mounting code.
 
   This program can be distributed under the terms of the GNU LGPLv2.
-  See the file COPYING.LIB.
+  See the file LGPL2.txt.
 */
 
 #include "fuse_config.h"
 #include "mount_util.h"
+
 #include <stdio.h>
 #include <unistd.h>
 #include <stdlib.h>
@@ -20,14 +21,16 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <paths.h>
-#if !defined( __NetBSD__) && !defined(__FreeBSD__) && !defined(__DragonFly__)
+#if !defined( __NetBSD__) && !defined(__FreeBSD__) && !defined(__DragonFly__) && !defined(__ANDROID__)
 #include <mntent.h>
 #else
 #define IGNORE_MTAB
 #endif
 #include <sys/stat.h>
 #include <sys/wait.h>
-#include <sys/mount.h>
+
+#include "fuse_mount_compat.h"
+
 #include <sys/param.h>
 
 #if defined(__NetBSD__) || defined(__FreeBSD__) || defined(__DragonFly__) || defined(__FreeBSD_kernel__)
@@ -51,7 +54,6 @@ static int mtab_needs_update(const char *mnt)
 	 * Skip mtab update if /etc/mtab:
 	 *
 	 *  - doesn't exist,
-	 *  - is a symlink,
 	 *  - is on a read-only filesystem.
 	 */
 	res = lstat(_PATH_MOUNTED, &stbuf);
@@ -61,9 +63,6 @@ static int mtab_needs_update(const char *mnt)
 	} else {
 		uid_t ruid;
 		int err;
-
-		if (S_ISLNK(stbuf.st_mode))
-			return 0;
 
 		ruid = getuid();
 		if (ruid != 0)
@@ -75,6 +74,10 @@ static int mtab_needs_update(const char *mnt)
 			setreuid(ruid, -1);
 
 		if (err == EROFS)
+			return 0;
+
+		res = access("/run/mount/utab", F_OK);
+		if (res == -1)
 			return 0;
 	}
 
@@ -359,6 +362,11 @@ int fuse_mnt_parse_fuse_fd(const char *mountpoint)
 {
 	int fd = -1;
 	int len = 0;
+
+	if (mountpoint == NULL) {
+		fprintf(stderr, "Invalid null-ptr mount-point!\n");
+		return -1;
+	}
 
 	if (sscanf(mountpoint, "/dev/fd/%u%n", &fd, &len) == 1 &&
 	    len == strlen(mountpoint)) {

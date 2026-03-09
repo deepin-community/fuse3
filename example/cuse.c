@@ -4,7 +4,7 @@
   Copyright (C) 2008-2009  Tejun Heo <tj@kernel.org>
 
   This program can be distributed under the terms of the GNU GPLv2.
-  See the file COPYING.
+  See the file GPL2.txt.
 
 */
 
@@ -85,6 +85,14 @@ static int cusexmp_expand(size_t new_size)
 	if (new_size > cusexmp_size)
 		return cusexmp_resize(new_size);
 	return 0;
+}
+
+static void cusexmp_init(void *userdata, struct fuse_conn_info *conn)
+{
+	(void)userdata;
+
+	/* Disable the receiving and processing of FUSE_INTERRUPT requests */
+	conn->no_interrupt = 1;
 }
 
 static void cusexmp_open(fuse_req_t req, struct fuse_file_info *fi)
@@ -281,6 +289,7 @@ static int cusexmp_process_arg(void *data, const char *arg, int key,
 }
 
 static const struct cuse_lowlevel_ops cusexmp_clop = {
+	.init           = cusexmp_init,
 	.open		= cusexmp_open,
 	.read		= cusexmp_read,
 	.write		= cusexmp_write,
