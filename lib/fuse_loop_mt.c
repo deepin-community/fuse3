@@ -5,14 +5,18 @@
   Implementation of the multi-threaded FUSE session loop.
 
   This program can be distributed under the terms of the GNU LGPLv2.
-  See the file COPYING.LIB.
+  See the file LGPL2.txt.
 */
+
+#define _GNU_SOURCE
 
 #include "fuse_config.h"
 #include "fuse_lowlevel.h"
 #include "fuse_misc.h"
 #include "fuse_kernel.h"
 #include "fuse_i.h"
+#include "fuse_uring_i.h"
+#include "util.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -50,14 +54,12 @@ struct fuse_worker {
 	struct fuse_mt *mt;
 };
 
+/* synchronization via se->mt_lock */
 struct fuse_mt {
-	pthread_mutex_t lock;
 	int numworker;
 	int numavail;
 	struct fuse_session *se;
 	struct fuse_worker main;
-	sem_t finish;
-	int exit;
 	int error;
 	int clone_fd;
 	int max_idle;
@@ -128,27 +130,30 @@ static void *fuse_do_work(void *data)
 {
 	struct fuse_worker *w = (struct fuse_worker *) data;
 	struct fuse_mt *mt = w->mt;
+	struct fuse_session *se = mt->se;
 
-	while (!fuse_session_exited(mt->se)) {
+	fuse_set_thread_name("fuse_worker");
+
+	while (!fuse_session_exited(se)) {
 		int isforget = 0;
 		int res;
 
 		pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, NULL);
-		res = fuse_session_receive_buf_int(mt->se, &w->fbuf, w->ch);
+		res = fuse_session_receive_buf_internal(se, &w->fbuf, w->ch);
 		pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
 		if (res == -EINTR)
 			continue;
 		if (res <= 0) {
 			if (res < 0) {
-				fuse_session_exit(mt->se);
+				fuse_session_exit(se);
 				mt->error = res;
 			}
 			break;
 		}
 
-		pthread_mutex_lock(&mt->lock);
-		if (mt->exit) {
-			pthread_mutex_unlock(&mt->lock);
+		pthread_mutex_lock(&se->mt_lock);
+		if (fuse_session_exited(se)) {
+			pthread_mutex_unlock(&se->mt_lock);
 			return NULL;
 		}
 
@@ -166,13 +171,14 @@ static void *fuse_do_work(void *data)
 
 		if (!isforget)
 			mt->numavail--;
-		if (mt->numavail == 0 && mt->numworker < mt->max_threads)
+		if (mt->numavail == 0 && mt->numworker < mt->max_threads &&
+		    likely(se->got_init))
 			fuse_loop_start_thread(mt);
-		pthread_mutex_unlock(&mt->lock);
+		pthread_mutex_unlock(&se->mt_lock);
 
-		fuse_session_process_buf_int(mt->se, &w->fbuf, w->ch);
+		fuse_session_process_buf_internal(se, &w->fbuf, w->ch);
 
-		pthread_mutex_lock(&mt->lock);
+		pthread_mutex_lock(&se->mt_lock);
 		if (!isforget)
 			mt->numavail++;
 
@@ -183,26 +189,25 @@ static void *fuse_do_work(void *data)
 		 * delayed, a moving average might be useful for that.
 		 */
 		if (mt->max_idle != -1 && mt->numavail > mt->max_idle && mt->numworker > 1) {
-			if (mt->exit) {
-				pthread_mutex_unlock(&mt->lock);
+			if (fuse_session_exited(se)) {
+				pthread_mutex_unlock(&se->mt_lock);
 				return NULL;
 			}
 			list_del_worker(w);
 			mt->numavail--;
 			mt->numworker--;
-			pthread_mutex_unlock(&mt->lock);
+			pthread_mutex_unlock(&se->mt_lock);
 
 			pthread_detach(w->thread_id);
-			free(w->fbuf.mem);
+			fuse_buf_free(&w->fbuf);
 			fuse_chan_put(w->ch);
 			free(w);
 			return NULL;
 		}
-		pthread_mutex_unlock(&mt->lock);
+		pthread_mutex_unlock(&se->mt_lock);
 	}
 
-	sem_post(&mt->finish);
-
+	sem_post(&se->mt_finish);
 	return NULL;
 }
 
@@ -220,8 +225,17 @@ int fuse_start_thread(pthread_t *thread_id, void *(*func)(void *), void *arg)
 	 */
 	pthread_attr_init(&attr);
 	stack_size = getenv(ENVNAME_THREAD_STACK);
-	if (stack_size && pthread_attr_setstacksize(&attr, atoi(stack_size)))
-		fuse_log(FUSE_LOG_ERR, "fuse: invalid stack size: %s\n", stack_size);
+	if (stack_size) {
+		long size;
+
+		res = libfuse_strtol(stack_size, &size);
+		if (res)
+			fuse_log(FUSE_LOG_ERR, "fuse: invalid stack size: %s\n",
+				 stack_size);
+		else if (pthread_attr_setstacksize(&attr, size))
+			fuse_log(FUSE_LOG_ERR, "fuse: could not set stack size: %ld\n",
+				 size);
+	}
 
 	/* Disallow signal reception in worker threads */
 	sigemptyset(&newset);
@@ -242,12 +256,11 @@ int fuse_start_thread(pthread_t *thread_id, void *(*func)(void *), void *arg)
 	return 0;
 }
 
-static struct fuse_chan *fuse_clone_chan(struct fuse_mt *mt)
+static int fuse_clone_chan_fd_default(struct fuse_session *se)
 {
 	int res;
 	int clonefd;
 	uint32_t masterfd;
-	struct fuse_chan *newch;
 	const char *devname = "/dev/fuse";
 
 #ifndef O_CLOEXEC
@@ -257,18 +270,46 @@ static struct fuse_chan *fuse_clone_chan(struct fuse_mt *mt)
 	if (clonefd == -1) {
 		fuse_log(FUSE_LOG_ERR, "fuse: failed to open %s: %s\n", devname,
 			strerror(errno));
-		return NULL;
+		return -1;
 	}
-	fcntl(clonefd, F_SETFD, FD_CLOEXEC);
+	if (!O_CLOEXEC) {
+		res = fcntl(clonefd, F_SETFD, FD_CLOEXEC);
+		if (res == -1) {
+			fuse_log(FUSE_LOG_ERR, "fuse: failed to set CLOEXEC: %s\n",
+				strerror(errno));
+			close(clonefd);
+			return -1;
+		}
+	}
 
-	masterfd = mt->se->fd;
+	masterfd = se->fd;
 	res = ioctl(clonefd, FUSE_DEV_IOC_CLONE, &masterfd);
 	if (res == -1) {
 		fuse_log(FUSE_LOG_ERR, "fuse: failed to clone device fd: %s\n",
 			strerror(errno));
 		close(clonefd);
-		return NULL;
+		return -1;
 	}
+	return clonefd;
+}
+
+static struct fuse_chan *fuse_clone_chan(struct fuse_mt *mt)
+{
+	int clonefd;
+	struct fuse_session *se = mt->se;
+	struct fuse_chan *newch;
+
+	if (se->io != NULL) {
+		if (se->io->clone_fd != NULL)
+			clonefd = se->io->clone_fd(se->fd);
+		else
+			return NULL;
+	} else {
+		clonefd = fuse_clone_chan_fd_default(se);
+	}
+	if (clonefd < 0)
+		return NULL;
+
 	newch = fuse_chan_new(clonefd);
 	if (newch == NULL)
 		close(clonefd);
@@ -316,10 +357,10 @@ static int fuse_loop_start_thread(struct fuse_mt *mt)
 static void fuse_join_worker(struct fuse_mt *mt, struct fuse_worker *w)
 {
 	pthread_join(w->thread_id, NULL);
-	pthread_mutex_lock(&mt->lock);
+	pthread_mutex_lock(&mt->se->mt_lock);
 	list_del_worker(w);
-	pthread_mutex_unlock(&mt->lock);
-	free(w->fbuf.mem);
+	pthread_mutex_unlock(&mt->se->mt_lock);
+	fuse_buf_free(&w->fbuf);
 	fuse_chan_put(w->ch);
 	free(w);
 }
@@ -354,34 +395,35 @@ int err;
 	mt.max_threads = config->max_threads;
 	mt.main.thread_id = pthread_self();
 	mt.main.prev = mt.main.next = &mt.main;
-	sem_init(&mt.finish, 0, 0);
-	pthread_mutex_init(&mt.lock, NULL);
 
-	pthread_mutex_lock(&mt.lock);
+	pthread_mutex_lock(&se->mt_lock);
 	err = fuse_loop_start_thread(&mt);
-	pthread_mutex_unlock(&mt.lock);
+	pthread_mutex_unlock(&se->mt_lock);
 	if (!err) {
-		/* sem_wait() is interruptible */
 		while (!fuse_session_exited(se))
-			sem_wait(&mt.finish);
+			sem_wait(&se->mt_finish);
+		if (se->debug)
+			fuse_log(FUSE_LOG_DEBUG,
+				 "fuse: session exited, terminating workers\n");
 
-		pthread_mutex_lock(&mt.lock);
+		pthread_mutex_lock(&se->mt_lock);
 		for (w = mt.main.next; w != &mt.main; w = w->next)
 			pthread_cancel(w->thread_id);
-		mt.exit = 1;
-		pthread_mutex_unlock(&mt.lock);
+		pthread_mutex_unlock(&se->mt_lock);
 
 		while (mt.main.next != &mt.main)
 			fuse_join_worker(&mt, mt.main.next);
 
 		err = mt.error;
+
+		if (se->uring.pool)
+			fuse_uring_stop(se);
 	}
 
-	pthread_mutex_destroy(&mt.lock);
-	sem_destroy(&mt.finish);
+	pthread_mutex_destroy(&se->mt_lock);
 	if(se->error != 0)
 		err = se->error;
-	fuse_session_reset(se);
+
 
 	if (created_config) {
 		fuse_loop_cfg_destroy(config);
@@ -419,10 +461,15 @@ int fuse_session_loop_mt_31(struct fuse_session *se, int clone_fd);
 FUSE_SYMVER("fuse_session_loop_mt_31", "fuse_session_loop_mt@FUSE_3.0")
 int fuse_session_loop_mt_31(struct fuse_session *se, int clone_fd)
 {
+	int err;
 	struct fuse_loop_config *config = fuse_loop_cfg_create();
 	if (clone_fd > 0)
 		 fuse_loop_cfg_set_clone_fd(config, clone_fd);
-	return fuse_session_loop_mt_312(se, config);
+	err = fuse_session_loop_mt_312(se, config);
+
+	fuse_loop_cfg_destroy(config);
+
+	return err;
 }
 
 struct fuse_loop_config *fuse_loop_cfg_create(void)
@@ -464,9 +511,11 @@ void fuse_loop_cfg_set_idle_threads(struct fuse_loop_config *config,
 				    unsigned int value)
 {
 	if (value > FUSE_LOOP_MT_MAX_THREADS) {
-		fuse_log(FUSE_LOG_ERR,
-			 "Ignoring invalid max threads value "
-			 "%u > max (%u).\n", value, FUSE_LOOP_MT_MAX_THREADS);
+		if (value != UINT_MAX)
+			fuse_log(FUSE_LOG_ERR,
+				 "Ignoring invalid max threads value "
+				 "%u > max (%u).\n", value,
+				 FUSE_LOOP_MT_MAX_THREADS);
 		return;
 	}
 	config->max_idle_threads = value;

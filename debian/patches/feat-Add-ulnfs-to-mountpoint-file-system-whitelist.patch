@@ -3,22 +3,15 @@ From: wangrong <wangrong@uniontech.com>
 Date: Tue, 30 Dec 2025 15:49:57 +0800
 Subject: [PATCH] feat: Add ulnfs to mountpoint file system whitelist
 
----
- util/fusermount.c | 1 +
- 1 file changed, 1 insertion(+)
-
-diff --git a/util/fusermount.c b/util/fusermount.c
-index 50989eb..037fbe5 100644
---- a/util/fusermount.c
-+++ b/util/fusermount.c
-@@ -1023,6 +1023,7 @@ static int check_perm(const char **mntp, struct stat *stbuf, int *mountpoint_fd)
- 		0x01021994 /* TMPFS_MAGIC */,
- 		0x24051905 /* UBIFS_SUPER_MAGIC */,
+Index: fuse3/util/fusermount.c
+===================================================================
+--- fuse3.orig/util/fusermount.c
++++ fuse3/util/fusermount.c
+@@ -1223,6 +1223,7 @@ static int check_perm(const char **mntp,
+ #if __SIZEOF_LONG__ > 4
  		0x736675005346544e /* UFSD */,
+ #endif
 +		0x00005C0F /* ULNFS */,
  		0x58465342 /* XFS_SB_MAGIC */,
  		0x2FC12FC1 /* ZFS_SUPER_MAGIC */,
- 	};
--- 
-2.43.4
-
+ 		0x858458f6 /* RAMFS_MAGIC */,
