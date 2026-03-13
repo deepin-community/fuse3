@@ -1,3 +1,9 @@
+fuse3 (3.18.1-1deepin1) unstable; urgency=medium
+
+  * Add ulnfs to mountpoint file system whitelist.
+
+ -- tunaichao <tunaichao@uniontech.com>  Fri, 13 Mar 2026 09:58:00 +0800
+
 fuse3 (3.18.1-1) unstable; urgency=medium
 
   * New upstream release.
