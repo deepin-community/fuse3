@@ -1,5 +1,7 @@
-revert_upgrade_of_fuse_kernel.h.patch
-update_header_name.patch
-Fix-max_threads-command-line-parameter-propagation.patch
-Fix_memory_leak_in_high_level_API.patch
-feat-Add-ulnfs-to-mountpoint-file-system-whitelist.patch
+Fix_meson_function_tests.patch
+meson.build-make-special_funcs-check-more-reliable.patch
+Make_conn-want-want_ext_conversion_non_fatal.patch
+Add-container_of-and-ROUND_UP-macros.patch
+Fix-fuse_apply_conn_info_opts.patch
+Fix-the-close_range-ifdef.patch
+memfs_ll-fix-deadlock.patch

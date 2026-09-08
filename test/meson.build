@@ -1,6 +1,6 @@
 # Compile helper programs
 td = []
-foreach prog: [ 'test_write_cache', 'test_setattr' ]
+foreach prog: [ 'test_write_cache', 'test_setattr', 'hello' ]
     td += executable(prog, prog + '.c',
                      include_directories: include_dirs,
                      link_with: [ libfuse ],
@@ -12,6 +12,12 @@ td += executable('test_syscalls', 'test_syscalls.c',
                  install: false)
 td += executable('readdir_inode', 'readdir_inode.c',
                  include_directories: include_dirs,
+                 install: false)
+td += executable('release_unlink_race', 'release_unlink_race.c',
+                 dependencies: [ libfuse_dep ],
+                 install: false)
+td += executable('test_want_conversion', 'test_want_conversion.c',
+                 dependencies: [ libfuse_dep ],
                  install: false)
 
 test_scripts = [ 'conftest.py', 'pytest.ini', 'test_examples.py',
