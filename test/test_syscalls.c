@@ -11,6 +11,7 @@
 #include <utime.h>
 #include <errno.h>
 #include <assert.h>
+#include <time.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <sys/stat.h>
@@ -84,9 +85,25 @@ static int is_dot_or_dotdot(const char *name) {
            (name[1] == '\0' || (name[1] == '.' && name[2] == '\0'));
 }
 
+/*
+ * Seconds since the first line this process printed. The origin is taken
+ * lazily so it needs no init call and cannot precede the first test.
+ */
+static double test_elapsed(void)
+{
+	static struct timespec start;
+	struct timespec now;
+
+	clock_gettime(CLOCK_MONOTONIC, &now);
+	if (start.tv_sec == 0 && start.tv_nsec == 0)
+		start = now;
+	return (now.tv_sec - start.tv_sec) +
+	       (now.tv_nsec - start.tv_nsec) / 1e9;
+}
+
 static void success(void)
 {
-	fprintf(stderr, "%s OK\n", testname);
+	fprintf(stderr, "+%8.3fs %s OK\n", test_elapsed(), testname);
 }
 
 #define this_test (&tests[testnum-1])
@@ -108,6 +125,11 @@ static void __start_test(const char *fmt, ...)
 		fprintf(stderr, "%s - too many tests\n", testname);
 		exit(1);
 	}
+	/* A test that never finishes prints nothing otherwise, leaving the log
+	 * ending at the last test that passed. stderr, so a SIGKILL cannot
+	 * swallow it.
+	 */
+	fprintf(stderr, "+%8.3fs %s START\n", test_elapsed(), testname);
 	this_test->fd = -1;
 }
 
@@ -773,7 +795,7 @@ static int test_seekdir(void)
 	int i;
 	int res;
 	DIR *dp;
-	struct dirent *de;
+	struct dirent *de = NULL;
 
 	start_test("seekdir");
 	res = create_dir(testdir, testdir_files);
@@ -916,6 +938,53 @@ static int test_copy_file_range(void)
 }
 #else
 static int test_copy_file_range(void)
+{
+	return 0;
+}
+#endif
+
+#ifdef HAVE_STATX
+static int test_statx(void)
+{
+	struct statx sb;
+	char msg[] = "hi";
+	size_t msg_size = sizeof(msg);
+	struct timespec tp;
+	int res;
+
+	memset(&sb, 0, sizeof(sb));
+	unlink(testfile);
+
+	start_test("statx");
+
+	res = create_testfile(testfile, msg, msg_size);
+	if (res == -1)
+		return -1;
+
+	res = statx(-1, testfile, AT_EMPTY_PATH,
+		    STATX_BASIC_STATS | STATX_BTIME, &sb);
+	if (res == -1)
+		return -1;
+
+	if (sb.stx_size != msg_size)
+		return -1;
+
+	clock_gettime(CLOCK_REALTIME, &tp);
+
+	if (sb.stx_btime.tv_sec > tp.tv_sec)
+		return -1;
+
+	if (sb.stx_btime.tv_sec == tp.tv_sec &&
+	    sb.stx_btime.tv_nsec >= tp.tv_nsec)
+		return -1;
+
+	unlink(testfile);
+
+	success();
+	return 0;
+}
+#else
+static int test_statx(void)
 {
 	return 0;
 }
@@ -1065,7 +1134,6 @@ static int test_create_unlink(void)
 	return 0;
 }
 
-#ifndef __FreeBSD__
 static int test_mknod(void)
 {
 	int err = 0;
@@ -1098,7 +1166,6 @@ static int test_mknod(void)
 	success();
 	return 0;
 }
-#endif
 
 #define test_open(exist, flags, mode)  do_test_open(exist, flags, #flags, mode)
 
@@ -1792,7 +1859,6 @@ fail:
 #undef PATH
 }
 
-#ifndef __FreeBSD__
 static int test_mkfifo(void)
 {
 	int res;
@@ -1824,7 +1890,6 @@ static int test_mkfifo(void)
 	success();
 	return 0;
 }
-#endif
 
 static int test_mkdir(void)
 {
@@ -1957,11 +2022,116 @@ static int do_test_create_ro_dir(int flags, const char *flags_str)
 	return 0;
 }
 
+#ifndef __FreeBSD__
+/* 	this tests open with O_TMPFILE
+	note that this will only work with the fuse low level api 
+	you will get ENOTSUP with the high level api */
+static int test_create_tmpfile(void) 
+{
+	rmdir(testdir);
+	int res = mkdir(testdir, 0777);
+	if (res)
+		return -1;
+	
+	start_test("create tmpfile");
+
+	int fd = open(testdir, O_TMPFILE | O_RDWR, S_IRUSR | S_IWUSR);
+	if(fd == -1) {
+		if (errno == ENOTSUP) {
+			/* don't bother if we're working on an old kernel 
+					or on the high level API */
+			return 0;
+		}
+
+		PERROR("open O_TMPFILE | O_RDWR");
+		return -1;
+	}
+	close(fd);
+
+	fd = open(testdir, O_TMPFILE | O_WRONLY | O_EXCL, S_IRUSR | S_IWUSR);
+	if(fd == -1){
+		PERROR("open with O_TMPFILE | O_WRONLY | O_EXCL");
+		return -1;
+	};
+	close(fd);
+
+	fd = open(testdir, O_TMPFILE | O_RDONLY, S_IRUSR);
+	if (fd != -1) {
+		ERROR("open with O_TMPFILE | O_RDONLY succeeded");
+		return -1;
+	}
+	
+	success();
+	return 0;	
+}
+
+static int test_create_and_link_tmpfile(void) 
+{
+	/* skip this test for now since the github runner will fail in the linkat call below */
+	return 0;
+
+	rmdir(testdir);
+	unlink(testfile);
+
+	int res = mkdir(testdir, 0777);
+	if (res)
+		return -1;
+
+	start_test("create and link tmpfile");
+
+	int fd = open(testdir, O_TMPFILE | O_RDWR | O_EXCL, S_IRUSR | S_IWUSR);
+	if(fd == -1) {
+		if (errno == ENOTSUP) {
+			/* don't bother if we're working on an old kernel
+				or on the high level API */
+			return 0;
+		}
+		PERROR("open with O_TMPFILE | O_RDWR | O_EXCL");
+		return -1;
+	}
+
+	if (!linkat(fd, "", AT_FDCWD, testfile, AT_EMPTY_PATH)) {
+		ERROR("linkat succeeded on a tmpfile opened with O_EXCL");
+		return -1;
+	}
+	close(fd);
+
+	fd = open(testdir, O_TMPFILE | O_RDWR, S_IRUSR | S_IWUSR);
+	if(fd == -1) {
+		PERROR("open O_TMPFILE");
+		return -1;
+	}
+	
+	if (check_nonexist(testfile)) {
+		return -1;
+	}
+
+	if (linkat(fd, "", AT_FDCWD, testfile, AT_EMPTY_PATH)) {
+		PERROR("linkat tempfile");
+		return -1;
+	}
+	close(fd);
+
+	if (check_nlink(testfile, 1)) {
+		return -1;
+	}
+	unlink(testfile);
+
+	success();
+	return 0;
+}
+#endif
+
 int main(int argc, char *argv[])
 {
 	int err = 0;
 	int a;
 	int is_root;
+
+	/* Piped stdout is fully buffered, so a killed test loses whatever it
+	 * had printed about what it was doing.
+	 */
+	setvbuf(stdout, NULL, _IOLBF, 0);
 
 	umask(0);
 	if (argc < 2 || argc > 4) {
@@ -2020,10 +2190,8 @@ int main(int argc, char *argv[])
 	err += test_symlink();
 	err += test_link();
 	err += test_link2();
-#ifndef __FreeBSD__	
 	err += test_mknod();
 	err += test_mkfifo();
-#endif
 	err += test_mkdir();
 	err += test_rename_file();
 	err += test_rename_dir();
@@ -2085,6 +2253,11 @@ int main(int argc, char *argv[])
 	err += test_create_ro_dir(O_CREAT | O_WRONLY);
 	err += test_create_ro_dir(O_CREAT | O_TRUNC);
 	err += test_copy_file_range();
+	err += test_statx();
+#ifndef __FreeBSD__
+	err += test_create_tmpfile();
+	err += test_create_and_link_tmpfile();
+#endif
 
 	unlink(testfile2);
 	unlink(testsock);

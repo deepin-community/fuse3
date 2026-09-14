@@ -7,7 +7,7 @@
   file system by implementing nothing but the request handlers.
 
   This program can be distributed under the terms of the GNU LGPLv2.
-  See the file COPYING.LIB.
+  See the file LGPL2.txt.
 */
 
 #include "fuse_config.h"
@@ -210,7 +210,7 @@ int fuse_parse_cmdline_312(struct fuse_args *args,
 {
 	memset(opts, 0, sizeof(struct fuse_cmdline_opts));
 
-	opts->max_idle_threads = -1; /* new default in fuse version 3.12 */
+	opts->max_idle_threads = UINT_MAX; /* new default in fuse version 3.12 */
 	opts->max_threads = 10;
 
 	if (fuse_opt_parse(args, opts, fuse_helper_opts,
@@ -238,7 +238,6 @@ int fuse_parse_cmdline_30(struct fuse_args *args,
 			  struct fuse_cmdline_opts *out_opts)
 {
 	struct fuse_cmdline_opts opts;
-
 
 	int rc = fuse_parse_cmdline_312(args, &opts);
 	if (rc == 0) {
@@ -270,16 +269,25 @@ int fuse_daemonize(int foreground)
 		switch(fork()) {
 		case -1:
 			perror("fuse_daemonize: fork");
+			close(waiter[0]);
+			close(waiter[1]);
 			return -1;
 		case 0:
+			/* child */
+			close(waiter[0]);
+			waiter[0] = -1;
 			break;
 		default:
+			/* parent */
 			(void) read(waiter[0], &completed, sizeof(completed));
+			close(waiter[0]);
+			close(waiter[1]);
 			_exit(0);
 		}
 
 		if (setsid() == -1) {
 			perror("fuse_daemonize: setsid");
+			close(waiter[1]);
 			return -1;
 		}
 
@@ -297,16 +305,18 @@ int fuse_daemonize(int foreground)
 		/* Propagate completion of daemon initialization */
 		completed = 1;
 		(void) write(waiter[1], &completed, sizeof(completed));
-		close(waiter[0]);
 		close(waiter[1]);
+		waiter[1] = -1;
 	} else {
-		(void) chdir("/");
+		(void)chdir("/");
 	}
+
 	return 0;
 }
 
-int fuse_main_real(int argc, char *argv[], const struct fuse_operations *op,
-		   size_t op_size, void *user_data)
+int fuse_main_real_versioned(int argc, char *argv[],
+			     const struct fuse_operations *op, size_t op_size,
+			     struct libfuse_version *version, void *user_data)
 {
 	struct fuse_args args = FUSE_ARGS_INIT(argc, argv);
 	struct fuse *fuse;
@@ -342,8 +352,11 @@ int fuse_main_real(int argc, char *argv[], const struct fuse_operations *op,
 		goto out1;
 	}
 
-
-	fuse = fuse_new_31(&args, op, op_size, user_data);
+	struct fuse *_fuse_new_31(struct fuse_args *args,
+			       const struct fuse_operations *op, size_t op_size,
+			       struct libfuse_version *version,
+			       void *user_data);
+	fuse = _fuse_new_31(&args, op, op_size, version, user_data);
 	if (fuse == NULL) {
 		res = 3;
 		goto out1;
@@ -377,6 +390,7 @@ int fuse_main_real(int argc, char *argv[], const struct fuse_operations *op,
 		fuse_loop_cfg_set_clone_fd(loop_config, opts.clone_fd);
 
 		fuse_loop_cfg_set_idle_threads(loop_config, opts.max_idle_threads);
+		fuse_loop_cfg_set_max_threads(loop_config, opts.max_threads);
 		res = fuse_loop_mt(fuse, loop_config);
 	}
 	if (res)
@@ -394,6 +408,16 @@ out1:
 	return res;
 }
 
+/* Not symboled, as not part of the official API */
+int fuse_main_real_30(int argc, char *argv[], const struct fuse_operations *op,
+		      size_t op_size, void *user_data);
+int fuse_main_real_30(int argc, char *argv[], const struct fuse_operations *op,
+		      size_t op_size, void *user_data)
+{
+	struct libfuse_version version = { 0 };
+	return fuse_main_real_versioned(argc, argv, op, op_size, &version,
+					user_data);
+}
 
 void fuse_apply_conn_info_opts(struct fuse_conn_info_opts *opts,
 			       struct fuse_conn_info *conn)
@@ -409,10 +433,17 @@ void fuse_apply_conn_info_opts(struct fuse_conn_info_opts *opts,
 	if(opts->set_max_readahead)
 		conn->max_readahead = opts->max_readahead;
 
-#define LL_ENABLE(cond,cap) \
-	if (cond) conn->want |= (cap)
-#define LL_DISABLE(cond,cap) \
-	if (cond) conn->want &= ~(cap)
+#define LL_ENABLE(cond, cap)                     \
+	do {                                     \
+		if (cond)                        \
+			fuse_set_feature_flag(conn, cap); \
+	} while (0)
+
+#define LL_DISABLE(cond, cap)                     \
+	do {                                      \
+		if (cond)                         \
+			fuse_unset_feature_flag(conn, cap); \
+	} while (0)
 
 	LL_ENABLE(opts->splice_read, FUSE_CAP_SPLICE_READ);
 	LL_DISABLE(opts->no_splice_read, FUSE_CAP_SPLICE_READ);
