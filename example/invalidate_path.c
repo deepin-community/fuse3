@@ -4,7 +4,7 @@
             (C) 2017 EditShare LLC <slawek.rudnicki@editshare.com>
 
   This program can be distributed under the terms of the GNU GPLv2.
-  See the file COPYING.
+  See the file GPL2.txt.
  */
 
 /** @file
@@ -117,9 +117,9 @@ static int xmp_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
 		(void) buf;
 		struct stat file_stat;
 		xmp_getattr("/" TIME_FILE_NAME, &file_stat, NULL);
-		filler(buf, TIME_FILE_NAME, &file_stat, 0, 0);
+		filler(buf, TIME_FILE_NAME, &file_stat, 0, FUSE_FILL_DIR_DEFAULTS);
 		xmp_getattr("/" GROW_FILE_NAME, &file_stat, NULL);
-		filler(buf, GROW_FILE_NAME, &file_stat, 0, 0);
+		filler(buf, GROW_FILE_NAME, &file_stat, 0, FUSE_FILL_DIR_DEFAULTS);
 		return 0;
 	}
 }
@@ -163,10 +163,11 @@ static const struct fuse_operations xmp_oper = {
 
 static void update_fs(void) {
 	static int count = 0;
+	struct tm tmbuf;
 	struct tm *now;
 	time_t t;
 	t = time(NULL);
-	now = localtime(&t);
+	now = localtime_r(&t, &tmbuf);
 	assert(now != NULL);
 
 	int time_file_size = strftime(time_file_contents, MAX_STR_LEN,
