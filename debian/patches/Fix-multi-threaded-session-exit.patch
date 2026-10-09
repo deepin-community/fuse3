@@ -1,0 +1,348 @@
+Description: Wake the multi-threaded session loop on exit
+ Backport the session-owned semaphore and atomic exit flag from upstream
+ PR #1201 so fuse_session_exit() wakes a loop blocked in sem_wait().
+ .
+ Keep the 3.14 worker-pool mutex and automatic session reset behavior.
+ Check semaphore initialization and release it with the session. Publish
+ the signal exit status before waking the loop, using release/acquire
+ ordering so a signal delivered to another thread cannot lose its status.
+ .
+ Add mount-free custom-I/O regressions for direct, signal and worker exits,
+ including repeated reuse of the same session.
+Origin: backport, https://github.com/libfuse/libfuse/commit/7c22a19593c2b00fe6d2d44ac4c5e841629b26f3
+Bug: https://github.com/libfuse/libfuse/issues/997
+Forwarded: not-needed
+Author: Bernd Schubert <bschubert@ddn.com>
+Author: zhaoyingzhen <zhaoyingzhen@uniontech.com>
+Last-Update: 2026-10-09
+
+--- a/lib/fuse_i.h
++++ b/lib/fuse_i.h
+@@ -9,6 +9,10 @@
+ #include "fuse.h"
+ #include "fuse_lowlevel.h"
+ 
++#include <semaphore.h>
++#include <stdatomic.h>
++#include <stdbool.h>
++
+ struct mount_opts;
+ 
+ struct fuse_req {
+@@ -43,7 +47,8 @@ struct fuse_notify_req {
+ 
+ struct fuse_session {
+ 	char *mountpoint;
+-	volatile int exited;
++	atomic_bool exited;
++	sem_t mt_finish;
+ 	int fd;
+ 	struct fuse_custom_io *io;
+ 	struct mount_opts *mo;
+--- a/lib/fuse_loop_mt.c
++++ b/lib/fuse_loop_mt.c
+@@ -56,7 +56,6 @@ struct fuse_mt {
+ 	int numavail;
+ 	struct fuse_session *se;
+ 	struct fuse_worker main;
+-	sem_t finish;
+ 	int exit;
+ 	int error;
+ 	int clone_fd;
+@@ -201,7 +200,7 @@ static void *fuse_do_work(void *data)
+ 		pthread_mutex_unlock(&mt->lock);
+ 	}
+ 
+-	sem_post(&mt->finish);
++	sem_post(&mt->se->mt_finish);
+ 
+ 	return NULL;
+ }
+@@ -354,7 +353,6 @@ int err;
+ 	mt.max_threads = config->max_threads;
+ 	mt.main.thread_id = pthread_self();
+ 	mt.main.prev = mt.main.next = &mt.main;
+-	sem_init(&mt.finish, 0, 0);
+ 	pthread_mutex_init(&mt.lock, NULL);
+ 
+ 	pthread_mutex_lock(&mt.lock);
+@@ -363,7 +361,7 @@ int err;
+ 	if (!err) {
+ 		/* sem_wait() is interruptible */
+ 		while (!fuse_session_exited(se))
+-			sem_wait(&mt.finish);
++			sem_wait(&se->mt_finish);
+ 
+ 		pthread_mutex_lock(&mt.lock);
+ 		for (w = mt.main.next; w != &mt.main; w = w->next)
+@@ -378,7 +376,6 @@ int err;
+ 	}
+ 
+ 	pthread_mutex_destroy(&mt.lock);
+-	sem_destroy(&mt.finish);
+ 	if(se->error != 0)
+ 		err = se->error;
+ 	fuse_session_reset(se);
+--- a/lib/fuse_lowlevel.c
++++ b/lib/fuse_lowlevel.c
+@@ -2770,6 +2770,7 @@ void fuse_session_destroy(struct fuse_se
+ 	if (llp != NULL)
+ 		fuse_ll_pipe_free(llp);
+ 	pthread_key_delete(se->pipe_key);
++	sem_destroy(&se->mt_finish);
+ 	pthread_mutex_destroy(&se->lock);
+ 	free(se->cuse_data);
+ 	if (se->fd != -1)
+@@ -2983,6 +2984,7 @@ struct fuse_session *fuse_session_new(st
+ 		goto out1;
+ 	}
+ 	se->fd = -1;
++	atomic_init(&se->exited, false);
+ 	se->conn.max_write = UINT_MAX;
+ 	se->conn.max_readahead = UINT_MAX;
+ 
+@@ -3028,11 +3030,17 @@ struct fuse_session *fuse_session_new(st
+ 	se->notify_ctr = 1;
+ 	pthread_mutex_init(&se->lock, NULL);
+ 
++	if (sem_init(&se->mt_finish, 0, 0) == -1) {
++		fuse_log(FUSE_LOG_ERR, "fuse: failed to initialize session semaphore: %s\n",
++			strerror(errno));
++		goto out5;
++	}
++
+ 	err = pthread_key_create(&se->pipe_key, fuse_ll_pipe_destructor);
+ 	if (err) {
+ 		fuse_log(FUSE_LOG_ERR, "fuse: failed to create thread specific key: %s\n",
+ 			strerror(err));
+-		goto out5;
++		goto out6;
+ 	}
+ 
+ 	memcpy(&se->op, op, op_size);
+@@ -3042,6 +3050,8 @@ struct fuse_session *fuse_session_new(st
+ 	se->mo = mo;
+ 	return se;
+ 
++out6:
++	sem_destroy(&se->mt_finish);
+ out5:
+ 	pthread_mutex_destroy(&se->lock);
+ out4:
+@@ -3224,23 +3234,20 @@ int fuse_req_getgroups(fuse_req_t req, i
+ }
+ #endif
+ 
+-/* Prevent spurious data race warning - we don't care
+- * about races for this flag */
+-__attribute__((no_sanitize_thread))
+ void fuse_session_exit(struct fuse_session *se)
+ {
+-	se->exited = 1;
++	/* Publish the exit status before waking the multi-threaded loop. */
++	atomic_store_explicit(&se->exited, true, memory_order_release);
++	sem_post(&se->mt_finish);
+ }
+ 
+-__attribute__((no_sanitize_thread))
+ void fuse_session_reset(struct fuse_session *se)
+ {
+-	se->exited = 0;
++	atomic_store_explicit(&se->exited, false, memory_order_relaxed);
+ 	se->error = 0;
+ }
+ 
+-__attribute__((no_sanitize_thread))
+ int fuse_session_exited(struct fuse_session *se)
+ {
+-	return se->exited;
++	return atomic_load_explicit(&se->exited, memory_order_acquire);
+ }
+--- a/lib/fuse_signals.c
++++ b/lib/fuse_signals.c
+@@ -22,12 +22,12 @@ static struct fuse_session *fuse_instanc
+ static void exit_handler(int sig)
+ {
+ 	if (fuse_instance) {
+-		fuse_session_exit(fuse_instance);
+ 		if(sig <= 0) {
+ 			fuse_log(FUSE_LOG_ERR, "assertion error: signal value <= 0\n");
+ 			abort();
+ 		}
+ 		fuse_instance->error = sig;
++		fuse_session_exit(fuse_instance);
+ 	}
+ }
+ 
+--- a/test/meson.build
++++ b/test/meson.build
+@@ -1,6 +1,6 @@
+ # Compile helper programs
+ td = []
+-foreach prog: [ 'test_write_cache', 'test_setattr' ]
++foreach prog: [ 'test_write_cache', 'test_setattr', 'test_session_exit' ]
+     td += executable(prog, prog + '.c',
+                      include_directories: include_dirs,
+                      link_with: [ libfuse ],
+@@ -15,7 +15,8 @@ td += executable('readdir_inode', 'readd
+                  install: false)
+ 
+ test_scripts = [ 'conftest.py', 'pytest.ini', 'test_examples.py',
+-                 'util.py', 'test_ctests.py', 'test_custom_io.py' ]
++                 'util.py', 'test_ctests.py', 'test_custom_io.py',
++                 'test_session_exit.py' ]
+ td += custom_target('test_scripts', input: test_scripts,
+                       output: test_scripts, build_by_default: true,
+                       command: ['cp', '-fPp',
+--- /dev/null
++++ b/test/test_session_exit.c
+@@ -0,0 +1,135 @@
++/*
++ * FUSE: Filesystem in Userspace
++ *
++ * Regression test for multi-threaded session exit (libfuse issue #997).
++ * No mount or /dev/fuse is needed: custom I/O blocks a worker on a pipe.
++ *
++ * This program can be distributed under the terms of the GNU LGPLv2.
++ * See the file COPYING.LIB
++ */
++
++#define FUSE_USE_VERSION 312
++
++#include "fuse_lowlevel.h"
++
++#include <errno.h>
++#include <pthread.h>
++#include <semaphore.h>
++#include <signal.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <unistd.h>
++
++struct test_state {
++	struct fuse_session *se;
++	sem_t reading;
++	int result;
++	int worker_exit;
++};
++
++static void check(int ok, const char *message)
++{
++	if (!ok) {
++		fprintf(stderr, "%s\n", message);
++		exit(1);
++	}
++}
++
++static ssize_t test_read(int fd, void *buf, size_t size, void *userdata)
++{
++	struct test_state *state = userdata;
++
++	check(sem_post(&state->reading) == 0, "sem_post failed");
++	if (state->worker_exit) {
++		fuse_session_exit(state->se);
++		return 0;
++	}
++	return read(fd, buf, size);
++}
++
++static ssize_t test_writev(int fd, struct iovec *iov, int count,
++			   void *userdata)
++{
++	(void) userdata;
++	return writev(fd, iov, count);
++}
++
++static void *run_loop(void *userdata)
++{
++	struct test_state *state = userdata;
++
++	state->result = fuse_session_loop_mt(state->se, NULL);
++	return NULL;
++}
++
++int main(int argc, char **argv)
++{
++	struct fuse_args args = FUSE_ARGS_INIT(0, NULL);
++	const struct fuse_lowlevel_ops ops = { 0 };
++	const struct fuse_custom_io io = {
++		.read = test_read,
++		.writev = test_writev,
++	};
++	struct test_state state = { 0 };
++	pthread_t loop_thread;
++	int pipefd[2];
++	int use_signal;
++	int iteration;
++	int ret;
++
++	check(argc == 2, "expected direct, signal or worker mode");
++	use_signal = strcmp(argv[1], "signal") == 0;
++	state.worker_exit = strcmp(argv[1], "worker") == 0;
++	check(use_signal || state.worker_exit || strcmp(argv[1], "direct") == 0,
++	      "unknown mode");
++	/* Bound hangs even when invoked without the pytest wrapper. */
++	alarm(10);
++	check(sem_init(&state.reading, 0, 0) == 0, "sem_init failed");
++	check(pipe(pipefd) == 0, "pipe failed");
++	check(fuse_opt_add_arg(&args, argv[0]) == 0, "fuse_opt_add_arg failed");
++	state.se = fuse_session_new(&args, &ops, sizeof(ops), &state);
++	check(state.se != NULL, "fuse_session_new failed");
++	check(fuse_session_custom_io(state.se, &io, pipefd[0]) == 0,
++	      "fuse_session_custom_io failed");
++	if (use_signal)
++		check(fuse_set_signal_handlers(state.se) == 0,
++		      "fuse_set_signal_handlers failed");
++
++	/* Also cover exit/reset before starting a loop. */
++	fuse_session_exit(state.se);
++	check(fuse_session_exited(state.se), "session did not exit");
++	fuse_session_reset(state.se);
++	check(!fuse_session_exited(state.se), "session did not reset");
++
++	/* Reuse the session to check semaphore lifetime and 3.14 reset behavior. */
++	for (iteration = 0; iteration < 10; iteration++) {
++		check(pthread_create(&loop_thread, NULL, run_loop, &state) == 0,
++		      "pthread_create failed");
++		do {
++			ret = sem_wait(&state.reading);
++		} while (ret == -1 && errno == EINTR);
++		check(ret == 0, "sem_wait failed");
++
++		if (use_signal) {
++			/* Deliver to this thread, not the thread in sem_wait(). */
++			check(raise(SIGTERM) == 0, "raise failed");
++		} else if (!state.worker_exit) {
++			fuse_session_exit(state.se);
++		}
++
++		check(pthread_join(loop_thread, NULL) == 0, "pthread_join failed");
++		check(state.result == (use_signal ? SIGTERM : 0),
++		      "unexpected loop exit status");
++		check(!fuse_session_exited(state.se), "loop did not reset session");
++	}
++
++	if (use_signal)
++		fuse_remove_signal_handlers(state.se);
++	fuse_session_destroy(state.se);
++	fuse_opt_free_args(&args);
++	close(pipefd[1]);
++	sem_destroy(&state.reading);
++	alarm(0);
++	return 0;
++}
+--- /dev/null
++++ b/test/test_session_exit.py
+@@ -0,0 +1,11 @@
++import os
++import subprocess
++
++import pytest
++
++
++@pytest.mark.parametrize('mode', ('direct', 'signal', 'worker'))
++def test_session_exit(mode, output_checker):
++    executable = os.path.join(os.path.dirname(__file__), 'test_session_exit')
++    subprocess.run([executable, mode], stdout=output_checker.fd,
++                   stderr=output_checker.fd, timeout=15, check=True)
